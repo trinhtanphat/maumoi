@@ -1,0 +1,14 @@
+{
+  "name": "maumoi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check.mjs",
+    "sql:smoke": "python3 scripts/sql_smoke.py"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

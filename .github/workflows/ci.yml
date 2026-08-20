@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install locked metadata
+        run: npm ci --ignore-scripts
+      - name: Unit tests
+        run: npm test
+      - name: D1 schema smoke
+        run: npm run sql:smoke
+      - name: Syntax check
+        run: npm run check
+      - name: Secret pattern scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RIE --exclude-dir=.git --exclude=package-lock.json "(ZALO_APP_SECRET|ZALO_OA_ACCESS_TOKEN|OTP_HASH_SECRET|ADMIN_BOOTSTRAP_SECRET)[[:space:]]*[:=][[:space:]]*['\"]" .; then
+            echo "Potential hard-coded production credential detected" >&2
+            exit 1
+          fi
