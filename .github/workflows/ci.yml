@@ -31,4 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ! grep -RIE --exclude-dir=.git --exclude='package-lock.json' '(ZALO_APP_SECRET|ZALO_OA_ACCESS_TOKEN|OTP_HASH_SECRET|ADMIN_BOOTSTRAP_SECRET)[[:space:]]*[:=][[:space:]]*["'"'][^"'"']+' .
+          if grep -RIE --exclude-dir=.git --exclude=package-lock.json "(ZALO_APP_SECRET|ZALO_OA_ACCESS_TOKEN|OTP_HASH_SECRET|ADMIN_BOOTSTRAP_SECRET)[[:space:]]*[:=][[:space:]]*['\"]" .; then
+            echo "Potential hard-coded production credential detected" >&2
+            exit 1
+          fi
