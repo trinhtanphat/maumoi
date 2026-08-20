@@ -1,0 +1,150 @@
+name: Cloudflare Production Bootstrap
+
+on:
+  push:
+    branches: [ops/cloudflare-bootstrap]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maumoi-cloudflare-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: "46646bc5777a895df590614528828dd2"
+      DEPLOY_REVISION: "241fc256bea7b2b78eaf126ca04b8f92e8f11f80"
+      PRODUCTION_URL: "https://maumoi.trinhtanphat.workers.dev"
+    steps:
+      - name: Checkout exact merged main
+        uses: actions/checkout@v4
+        with:
+          ref: 241fc256bea7b2b78eaf126ca04b8f92e8f11f80
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Verify exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$DEPLOY_REVISION"
+          npm ci --ignore-scripts
+          npm test
+          npm run sql:smoke
+          npm run check
+
+      - name: Require existing Cloudflare credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "::error::Missing CLOUDFLARE_API_TOKEN repository secret"; exit 1; }
+
+      - name: Install current Wrangler
+        shell: bash
+        run: npm install --no-save --ignore-scripts wrangler@latest
+
+      - name: Reuse or create D1 and R2
+        id: resources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npx wrangler d1 list --json > /tmp/d1.json
+          DB_ID="$(node <<'NODE'
+          const fs = require('fs');
+          const raw = JSON.parse(fs.readFileSync('/tmp/d1.json', 'utf8'));
+          const rows = Array.isArray(raw) ? raw : (raw.result || []);
+          const db = rows.find((x) => x.name === 'maumoi-db');
+          if (db) process.stdout.write(String(db.uuid || db.id || db.database_id || ''));
+          NODE
+          )"
+
+          if [ -z "$DB_ID" ]; then
+            npx wrangler d1 create maumoi-db --location apac
+            npx wrangler d1 list --json > /tmp/d1.json
+            DB_ID="$(node <<'NODE'
+          const fs = require('fs');
+          const raw = JSON.parse(fs.readFileSync('/tmp/d1.json', 'utf8'));
+          const rows = Array.isArray(raw) ? raw : (raw.result || []);
+          const db = rows.find((x) => x.name === 'maumoi-db');
+          if (db) process.stdout.write(String(db.uuid || db.id || db.database_id || ''));
+          NODE
+            )"
+          fi
+
+          test -n "$DB_ID" || { echo "::error::Could not resolve maumoi-db ID"; exit 1; }
+
+          if ! npx wrangler r2 bucket info maumoi-evidence --json >/tmp/r2.json 2>/tmp/r2.err; then
+            npx wrangler r2 bucket create maumoi-evidence
+            npx wrangler r2 bucket info maumoi-evidence --json >/tmp/r2.json
+          fi
+
+          echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
+          echo "D1 maumoi-db: $DB_ID"
+          echo "R2 maumoi-evidence: ready"
+
+      - name: Generate exact production config
+        shell: bash
+        env:
+          D1_DATABASE_ID: ${{ steps.resources.outputs.database_id }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const config = JSON.parse(fs.readFileSync('wrangler.jsonc', 'utf8'));
+          config.d1_databases[0].database_id = process.env.D1_DATABASE_ID;
+          config.vars = { ...(config.vars || {}), APP_VERSION: process.env.DEPLOY_REVISION };
+          fs.writeFileSync('wrangler.deploy.json', JSON.stringify(config, null, 2) + '\n');
+          NODE
+
+      - name: Apply D1 migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations apply DB --remote --config wrangler.deploy.json
+          npx wrangler d1 execute DB --remote --config wrangler.deploy.json --json --command "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table';" | tee /tmp/db-smoke.json
+
+      - name: Deploy exact main Worker
+        shell: bash
+        run: npx wrangler deploy --config wrangler.deploy.json
+
+      - name: Production smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          retry() {
+            local url="$1"
+            local pattern="$2"
+            local body=""
+            for attempt in 1 2 3 4 5 6; do
+              body="$(curl --fail --silent --show-error --location --max-time 20 "$url" || true)"
+              if grep -Eiq "$pattern" <<<"$body"; then
+                printf '%s' "$body"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::error::Smoke failed for $url"
+            printf '%s\n' "$body" | head -c 2000
+            exit 1
+          }
+
+          retry "$PRODUCTION_URL/api/health" '"status"[[:space:]]*:[[:space:]]*"ok"' | tee /tmp/health.json
+          retry "$PRODUCTION_URL/api/version" "$DEPLOY_REVISION" | tee /tmp/version.json
+          retry "$PRODUCTION_URL/" '<!doctype|<html' >/tmp/index.html
+
+          code="$(curl --silent --output /tmp/unauthorized.json --write-out '%{http_code}' "$PRODUCTION_URL/api/admin/auth/me")"
+          test "$code" = "401" || { echo "::error::Expected 401 from unauthenticated admin endpoint, got $code"; cat /tmp/unauthorized.json; exit 1; }
+
+          echo "Production smoke OK: $PRODUCTION_URL"
