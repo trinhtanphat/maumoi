@@ -3,6 +3,8 @@ name: Cloudflare Production Bootstrap
 on:
   push:
     branches: [ops/cloudflare-bootstrap]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
